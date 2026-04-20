@@ -12,7 +12,7 @@ API:
 import asyncio
 import os
 import tempfile
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, Response
 import edge_tts
 
 app = Flask(__name__)
@@ -66,6 +66,43 @@ async def _list_voices():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "voice": DEFAULT_VOICE})
+
+
+@app.route("/tts/stream", methods=["GET"])
+def tts_stream():
+    """Streaming TTS — yields MP3 chunks as edge-tts generates them.
+    Reduces time-to-first-audio because AVPlayer can buffer + play
+    while the server is still synthesizing.
+    Uses GET so AVPlayer can consume the URL directly."""
+    text = request.args.get("text", "").strip()
+    voice = request.args.get("voice", DEFAULT_VOICE)
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+
+    def generate():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            communicate = edge_tts.Communicate(text, voice)
+            agen = communicate.stream()
+            while True:
+                try:
+                    chunk = loop.run_until_complete(agen.__anext__())
+                    if chunk["type"] == "audio":
+                        yield chunk["data"]
+                except StopAsyncIteration:
+                    break
+        finally:
+            loop.close()
+
+    return Response(
+        generate(),
+        mimetype="audio/mpeg",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.route("/", methods=["GET"])
