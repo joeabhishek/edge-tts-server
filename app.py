@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
 Edge TTS Server — Free, unlimited text-to-speech using Microsoft Edge neural voices.
+Also acts as a thin Groq LLM proxy so the iOS client doesn't need to ship an API key
+(GROQ_API_KEY is read from server env at request time).
 Deploy to Render.com, Railway, or any cloud host.
 
 API:
-    POST /tts  {"text": "Hello", "voice": "en-US-AriaNeural"} → audio/mpeg
-    GET /voices → list of available English voices
-    GET /health → {"status": "ok"}
+    POST /tts                     {"text": "Hello", "voice": "en-US-AriaNeural"} → audio/mpeg
+    GET  /tts/stream?text=…       streaming MP3 (low-latency)
+    GET  /voices                  list of available English voices
+    GET  /health                  {"status": "ok"}
+    POST /llm/chat/completions    OpenAI-compatible chat completions → Groq
+                                  (server adds Authorization header from GROQ_API_KEY env)
 """
 
 import asyncio
 import os
 import tempfile
-from flask import Flask, request, send_file, jsonify, Response
+
 import edge_tts
+import requests
+from flask import Flask, jsonify, request, Response, send_file
 
 app = Flask(__name__)
 
@@ -107,12 +114,101 @@ def tts_stream():
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({
-        "service": "Edge TTS Server",
-        "usage": "POST /tts with {\"text\": \"your text\"}",
-        "voices": "GET /voices",
-        "health": "GET /health",
-    })
+    return jsonify(
+        {
+            "service": "Edge TTS Server",
+            "usage": 'POST /tts with {"text": "your text"}',
+            "voices": "GET /voices",
+            "health": "GET /health",
+            "llm": "POST /llm/chat/completions (OpenAI-compatible Groq proxy)",
+        }
+    )
+
+
+# ----------------------------------------------------------------------------
+# Groq LLM proxy
+#
+# The iOS client used to ship a literal Groq API key in Secrets.swift, so every
+# install on every teammate's device shared one free-tier rate-limit budget
+# (~30 req/min). With multi-frame Live AI turns + multiple testers, that bucket
+# emptied fast and the app surfaced "API error: HTTP 429".
+#
+# This route accepts the same OpenAI-compatible chat completions request body
+# the iOS client used to send to api.groq.com directly, attaches the Bearer
+# header server-side from the GROQ_API_KEY env var, and forwards. Streams the
+# SSE response straight through when stream=true; buffers when stream=false.
+# Key never leaves the server. To rotate, change the env var on Render.
+# ----------------------------------------------------------------------------
+
+GROQ_UPSTREAM = "https://api.groq.com/openai/v1/chat/completions"
+
+
+@app.route("/llm/chat/completions", methods=["POST"])
+def llm_chat_completions():
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return (
+            jsonify(
+                {
+                    "error": "Server misconfigured: GROQ_API_KEY env var is not set on this server."
+                }
+            ),
+            500,
+        )
+
+    body = request.get_data()
+    # Detect stream=true without parsing JSON (some clients pretty-print, some don't).
+    body_compact = body.replace(b" ", b"").replace(b"\n", b"").replace(b"\t", b"")
+    is_stream = b'"stream":true' in body_compact
+
+    upstream_headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "text/event-stream" if is_stream else "application/json",
+    }
+
+    try:
+        upstream = requests.post(
+            GROQ_UPSTREAM,
+            data=body,
+            headers=upstream_headers,
+            stream=is_stream,
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        return jsonify({"error": f"Upstream request failed: {e}"}), 502
+
+    upstream_content_type = upstream.headers.get("Content-Type", "application/json")
+
+    if is_stream:
+
+        def relay():
+            try:
+                # chunk_size=None yields raw chunks as they arrive on the wire,
+                # which is what we want for SSE — don't buffer whole events.
+                for chunk in upstream.iter_content(chunk_size=None):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        return Response(
+            relay(),
+            status=upstream.status_code,
+            mimetype=upstream_content_type,
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    else:
+        data = upstream.content
+        upstream.close()
+        return Response(
+            data,
+            status=upstream.status_code,
+            mimetype=upstream_content_type,
+        )
 
 
 if __name__ == "__main__":
