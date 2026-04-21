@@ -16,6 +16,10 @@ Groq LLM proxy so the iOS client doesn't need to ship an API key.
    - `GROQ_API_KEY` = your Groq API key from [console.groq.com](https://console.groq.com).
      Required for the `/llm/chat/completions` route. Without it, every LLM
      request returns HTTP 500 and the iOS app shows "API error: HTTP 500".
+   - `LLM_RATE_LIMIT` (optional) = per-IP rate limit string for the LLM
+     proxy. Default is `30 per minute` (matches Groq's free per-key
+     ceiling). Examples: `60 per minute`, `5 per second`, `1000 per hour`.
+     See [flask-limiter syntax](https://flask-limiter.readthedocs.io/en/stable/).
 6. Deploy
 
 Your server will be at: `https://your-service-name.onrender.com`
@@ -67,3 +71,19 @@ python app.py
 Go to Render dashboard → this service → Environment → edit `GROQ_API_KEY` →
 **Save Changes**. Render redeploys with the new value; iOS clients keep
 working without a rebuild.
+
+## Per-IP Rate Limiting
+
+The `/llm/chat/completions` route enforces a per-IP throttle (default 30
+req/min) so a single device — or a runaway loop — can't drain the upstream
+Groq budget for the whole team. Hit limits return HTTP 429 with a JSON
+`error` body. iOS already surfaces 429 as the "API error" toast.
+
+Tune via `LLM_RATE_LIMIT` env var (string format, e.g. `60 per minute`).
+Render's load balancer forwards the real client IP via `X-Forwarded-For`,
+which `werkzeug.middleware.proxy_fix.ProxyFix` plumbs into
+`request.remote_addr` — that's what `flask-limiter` keys on.
+
+The TTS routes (`/tts`, `/tts/stream`, `/voices`, `/health`) are NOT
+rate-limited — they're unauthenticated, edge-cached, and don't proxy to a
+metered upstream.

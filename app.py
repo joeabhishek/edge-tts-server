@@ -21,8 +21,31 @@ import tempfile
 import edge_tts
 import requests
 from flask import Flask, jsonify, request, Response, send_file
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+
+# Render sits behind a load balancer that injects X-Forwarded-For. ProxyFix
+# makes request.remote_addr return the real client IP (the first hop in
+# X-Forwarded-For), which is what flask-limiter keys per-IP rate limits on.
+# Without this, every request would look like it came from Render's edge IP
+# and the per-IP limiter would behave like a global limiter.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# Per-IP rate limiter for the Groq proxy.
+# Default 30 req/min (matches Groq's free per-key ceiling) per teammate device,
+# overridable via LLM_RATE_LIMIT env var (e.g. "60 per minute" or "5 per second").
+# In-memory storage — fine for a single Render instance; switch to Redis if you
+# ever scale to multiple instances.
+LLM_RATE_LIMIT = os.environ.get("LLM_RATE_LIMIT", "30 per minute")
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[],  # no default — only the LLM proxy is rate-limited
+    storage_uri="memory://",
+)
 
 DEFAULT_VOICE = "en-US-AriaNeural"
 
@@ -144,6 +167,7 @@ GROQ_UPSTREAM = "https://api.groq.com/openai/v1/chat/completions"
 
 
 @app.route("/llm/chat/completions", methods=["POST"])
+@limiter.limit(lambda: LLM_RATE_LIMIT)
 def llm_chat_completions():
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
