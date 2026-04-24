@@ -17,6 +17,8 @@ API:
 import asyncio
 import os
 import tempfile
+import threading
+from collections import OrderedDict
 
 import edge_tts
 import requests
@@ -48,6 +50,28 @@ limiter = Limiter(
 )
 
 DEFAULT_VOICE = "en-US-AriaNeural"
+
+
+# ----------------------------------------------------------------------------
+# /tts/stream LRU cache
+#
+# Each call to edge-tts opens a fresh WebSocket to Microsoft's speech.platform
+# .bing.com endpoint and streams MP3 chunks back — about 150–300 ms before the
+# first byte leaves Render even on a hot path. Many of our calls hit the same
+# text repeatedly: the Live AI auto-intro fires every time the camera flips
+# on, conversation starters re-trigger, short replies like "Sure!" or "Got it."
+# come up constantly. Caching them gives near-instant replay (no WebSocket,
+# no synthesis) at the cost of <20 MB RAM.
+#
+# Storage model: OrderedDict so we get O(1) LRU eviction. Values are the full
+# list of MP3 chunks edge-tts produced; we replay them in order on a hit so
+# the wire format is identical to a fresh stream. Thread-safe via a single
+# Lock since gunicorn sync workers serve requests on different threads.
+# ----------------------------------------------------------------------------
+
+TTS_CACHE_MAX_ENTRIES = 256
+_tts_cache: "OrderedDict[tuple, list[bytes]]" = OrderedDict()
+_tts_cache_lock = threading.Lock()
 
 
 @app.route("/tts", methods=["POST"])
@@ -103,13 +127,33 @@ def tts_stream():
     """Streaming TTS — yields MP3 chunks as edge-tts generates them.
     Reduces time-to-first-audio because AVPlayer can buffer + play
     while the server is still synthesizing.
-    Uses GET so AVPlayer can consume the URL directly."""
+    Uses GET so AVPlayer can consume the URL directly.
+
+    Cached: a second call with the same (text, voice) tuple replays the
+    stored chunks without touching edge-tts, eliminating the ~150–300 ms
+    WebSocket-to-Microsoft round-trip on cache hits."""
     text = request.args.get("text", "").strip()
     voice = request.args.get("voice", DEFAULT_VOICE)
     if not text:
         return jsonify({"error": "No text provided"}), 400
 
+    cache_key = (text, voice)
+
     def generate():
+        # Cache hit — mark recently-used and replay stored chunks.
+        with _tts_cache_lock:
+            cached = _tts_cache.get(cache_key)
+            if cached is not None:
+                _tts_cache.move_to_end(cache_key)
+        if cached is not None:
+            for chunk in cached:
+                yield chunk
+            return
+
+        # Cache miss — generate, accumulate, store after success.
+        # We don't cache partial results on error so a transient edge-tts
+        # failure won't poison the cache.
+        chunks: list[bytes] = []
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
@@ -119,11 +163,19 @@ def tts_stream():
                 try:
                     chunk = loop.run_until_complete(agen.__anext__())
                     if chunk["type"] == "audio":
-                        yield chunk["data"]
+                        data = chunk["data"]
+                        chunks.append(data)
+                        yield data
                 except StopAsyncIteration:
                     break
         finally:
             loop.close()
+
+        # Only cache fully-completed responses.
+        with _tts_cache_lock:
+            _tts_cache[cache_key] = chunks
+            while len(_tts_cache) > TTS_CACHE_MAX_ENTRIES:
+                _tts_cache.popitem(last=False)
 
     return Response(
         generate(),
